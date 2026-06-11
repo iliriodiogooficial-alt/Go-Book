@@ -1,0 +1,6 @@
+{
+  "name": "Go book",
+  "description": "Uma plataforma inteligente que transforma seus estudos em guias resumidos em PDF e podcasts em áudio com duas vozes debatendo a matéria de forma simples.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
