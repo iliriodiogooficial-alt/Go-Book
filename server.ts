@@ -34,6 +34,43 @@ const getGeminiClient = () => {
   });
 };
 
+// Helper function to call async operations with retry backoff for transient 503/429 errors
+async function callWithRetry<T>(fn: () => Promise<T>, retries = 5, initialDelay = 1500): Promise<T> {
+  let attempt = 0;
+  while (attempt < retries) {
+    try {
+      return await fn();
+    } catch (error: any) {
+      attempt++;
+      
+      const errorMessage = (error?.message || error?.statusText || "").toString();
+      const errorCode = error?.status || error?.code || 0;
+      
+      const isTransient = 
+        errorCode === 503 || 
+        errorCode === 429 ||
+        errorCode === 408 ||
+        errorMessage.includes("503") ||
+        errorMessage.includes("429") ||
+        errorMessage.includes("high demand") ||
+        errorMessage.includes("temporary") ||
+        errorMessage.includes("UNAVAILABLE") ||
+        errorMessage.includes("overloaded") ||
+        errorMessage.includes("Service Unavailable") ||
+        errorMessage.includes("Resource has been exhausted");
+
+      if (isTransient && attempt < retries) {
+        const delay = initialDelay * Math.pow(2, attempt) + Math.random() * 500;
+        console.warn(`[Gemini API] TRANSIENT ERROR (${errorCode || 'NoCode'}: ${errorMessage}). Attempt ${attempt}/${retries}. Retrying in ${Math.round(delay)}ms...`);
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      } else {
+        throw error;
+      }
+    }
+  }
+  throw new Error("Erro de conexão persistente com a API (limite de tentativas excedido - 503/429). Por favor, tente novamente em instantes.");
+}
+
 // Simple Healthcheck API
 app.get("/api/health", (req, res) => {
   res.json({ status: "ok", time: new Date().toISOString() });
@@ -93,7 +130,7 @@ app.post("/api/study/generate", async (req, res) => {
 
     parts.push({ text: userPrompt });
 
-    const response = await ai.models.generateContent({
+    const response = await callWithRetry(() => ai.models.generateContent({
       model: "gemini-3.5-flash",
       contents: { parts },
       config: {
@@ -136,7 +173,7 @@ app.post("/api/study/generate", async (req, res) => {
           required: ["title", "summary", "contentMarkdown", "podcastScript"]
         }
       }
-    });
+    }));
 
     const resultText = response.text;
     if (!resultText) {
@@ -197,61 +234,76 @@ app.post("/api/study/podcast", async (req, res) => {
 
     const ai = getGeminiClient();
 
-    // Format script into plain text prompt indicating conversation speakers
-    // Example:
-    // Lucas: Olá, tudo bem?
-    // Mariana: Oi Lucas!
-    const formattedDialogue = podcastScript
-      .map((lineObject: any) => `${lineObject.speaker}: ${lineObject.text}`)
-      .join("\n\n");
-
-    const ttsPrompt = 
-      `TTS the following educational podcast conversation between Lucas and Mariana. ` +
-      `Make sure the audio voices match the characters perfectly:\n\n${formattedDialogue}`;
-
-    // Use multiSpeakerVoiceConfig to map Lucase and Mariana to prebuilt voices
-    // voiceName options: 'Puck', 'Charon', 'Kore', 'Fenrir', 'Zephyr'
-    // Let's match:
-    // Lucas -> 'Zephyr' (expressive, energetic tone)
-    // Mariana -> 'Kore' (clear, soothing, tutor-like tone)
-    const response = await ai.models.generateContent({
-      model: "gemini-3.1-flash-tts-preview",
-      contents: [{ parts: [{ text: ttsPrompt }] }],
-      config: {
-        responseModalities: ["AUDIO"],
-        speechConfig: {
-          multiSpeakerVoiceConfig: {
-            speakerVoiceConfigs: [
-              {
-                speaker: "Lucas",
-                voiceConfig: {
-                  prebuiltVoiceConfig: { voiceName: "Zephyr" }
-                }
-              },
-              {
-                speaker: "Mariana",
-                voiceConfig: {
-                  prebuiltVoiceConfig: { voiceName: "Kore" }
-                }
-              }
-            ]
-          }
-        }
-      }
-    });
-
-    // Extract the raw base64 PCM data
-    const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-
-    if (!base64Audio) {
-      throw new Error("O modelo de áudio não retornou dados de voz válidos.");
+    // Group the dialogues into smaller chunks (of size 3 lines) to stay safely within TTS limits.
+    // This supports arbitrary-length podcasts (e.g., 5+ minutes total, up to 30 dialogues) flawlessly.
+    const chunkSize = 3;
+    const chunks: any[][] = [];
+    for (let i = 0; i < podcastScript.length; i += chunkSize) {
+      chunks.push(podcastScript.slice(i, i + chunkSize));
     }
 
-    // Convert base64 to binary buffer
-    const pcmBuffer = Buffer.from(base64Audio, "base64");
+    console.log(`[Go book] Split podcast into ${chunks.length} segments for robust compilation.`);
+
+    const pcmBuffers: Buffer[] = [];
+
+    // Process chunk by chunk to gather all voices, with exponential backoff for high resilience.
+    for (let c = 0; c < chunks.length; c++) {
+      const chunk = chunks[c];
+      const chunkDialogue = chunk
+        .map((lineObject: any) => `${lineObject.speaker}: ${lineObject.text}`)
+        .join("\n\n");
+
+      const ttsPrompt = 
+        `TTS the following segment of an educational podcast conversation between Lucas and Mariana. ` +
+        `Make sure the audio voices match the characters perfectly:\n\n${chunkDialogue}`;
+
+      console.log(`[Go book] Compiling audio chunk ${c + 1}/${chunks.length}...`);
+
+      const response = await callWithRetry(() => ai.models.generateContent({
+        model: "gemini-3.1-flash-tts-preview",
+        contents: [{ parts: [{ text: ttsPrompt }] }],
+        config: {
+          responseModalities: ["AUDIO"],
+          speechConfig: {
+            multiSpeakerVoiceConfig: {
+              speakerVoiceConfigs: [
+                {
+                  speaker: "Lucas",
+                  voiceConfig: {
+                    prebuiltVoiceConfig: { voiceName: "Zephyr" }
+                  }
+                },
+                {
+                  speaker: "Mariana",
+                  voiceConfig: {
+                    prebuiltVoiceConfig: { voiceName: "Kore" }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }));
+
+      const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+      if (!base64Audio) {
+        console.warn(`[Go book] WARNING: Audio part ${c + 1}/${chunks.length} did not return audio.`);
+        continue;
+      }
+
+      const pcmBuffer = Buffer.from(base64Audio, "base64");
+      pcmBuffers.push(pcmBuffer);
+    }
+
+    if (pcmBuffers.length === 0) {
+      throw new Error("Não foi possível coletar faixas de voz válidas do modelo de áudio.");
+    }
+
+    // Concatenate all sound byte buffers together natively
+    const combinedPcm = Buffer.concat(pcmBuffers);
     
-    // Add WAV structure (24000Hz mono 16bit)
-    const wavBuffer = pcmToWav(pcmBuffer, 24000);
+    // Construct single WAV wrapper header
+    const wavBuffer = pcmToWav(combinedPcm, 24000);
 
     // Return the audio as WAV format directly
     res.setHeader("Content-Type", "audio/wav");
