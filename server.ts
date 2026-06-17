@@ -130,50 +130,71 @@ app.post("/api/study/generate", async (req, res) => {
 
     parts.push({ text: userPrompt });
 
-    const response = await callWithRetry(() => ai.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: { parts },
-      config: {
-        systemInstruction,
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            title: {
-              type: Type.STRING,
-              description: "Um título curto, impactante e convidativo para o assunto de estudo."
-            },
-            summary: {
-              type: Type.STRING,
-              description: "Um resumo executivo curto de 2 a 3 linhas explicando o que será aprendido."
-            },
-            contentMarkdown: {
-              type: Type.STRING,
-              description: "A explicação detalhada da matéria, formatada em Markdown com cabeçalhos (#, ##), listas e tabelas se necessário."
-            },
-            podcastScript: {
-              type: Type.ARRAY,
-              description: "Lista substancial e longa de falas do roteiro do podcast.",
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  speaker: {
-                    type: Type.STRING,
-                    description: "Nome do personagem que fala: obrigatoriamente 'Lucas' ou 'Mariana'."
-                  },
-                  text: {
-                    type: Type.STRING,
-                    description: "Linha de diálogo dita pelo personagem em português, contendo de 3 a 5 frases ricas, explicativas e com conteúdo denso."
-                  }
+    let response: any;
+    let lastError: any = null;
+    let generationSuccess = false;
+    const modelsToTry = ["gemini-2.5-flash", "gemini-3.5-flash"];
+
+    for (const modelName of modelsToTry) {
+      try {
+        console.log(`[Go book] Tentando gerar kit de estudo usando o modelo: ${modelName}`);
+        response = await callWithRetry(() => ai.models.generateContent({
+          model: modelName,
+          contents: { parts },
+          config: {
+            systemInstruction,
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                title: {
+                  type: Type.STRING,
+                  description: "Um título curto, impactante e convidativo para o assunto de estudo."
                 },
-                required: ["speaker", "text"]
-              }
+                summary: {
+                  type: Type.STRING,
+                  description: "Um resumo executivo curto de 2 a 3 linhas explicando o que será aprendido."
+                },
+                contentMarkdown: {
+                  type: Type.STRING,
+                  description: "A explicação detalhada da matéria, formatada em Markdown com cabeçalhos (#, ##), listas e tabelas se necessário."
+                },
+                podcastScript: {
+                  type: Type.ARRAY,
+                  description: "Lista substancial e longa de falas do roteiro do podcast.",
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      speaker: {
+                        type: Type.STRING,
+                        description: "Nome do personagem que fala: obrigatoriamente 'Lucas' ou 'Mariana'."
+                      },
+                      text: {
+                        type: Type.STRING,
+                        description: "Linha de diálogo dita pelo personagem em português, contendo de 3 a 5 frases ricas, explicativas e com conteúdo denso."
+                      }
+                    },
+                    required: ["speaker", "text"]
+                  }
+                }
+              },
+              required: ["title", "summary", "contentMarkdown", "podcastScript"]
             }
-          },
-          required: ["title", "summary", "contentMarkdown", "podcastScript"]
-        }
+          }
+        }), 2, 1000); // 2 retries per model, low delay to switch quickly on 503 errors
+        
+        generationSuccess = true;
+        console.log(`[Go book] Kit de estudo gerado com sucesso usando o modelo: ${modelName}`);
+        break;
+      } catch (err: any) {
+        lastError = err;
+        console.warn(`[Go book] Falha ao tentar com o modelo ${modelName}:`, err.message || err);
       }
-    }));
+    }
+
+    if (!generationSuccess) {
+      throw lastError || new Error("Não foi possível gerar o material usando os modelos disponíveis por alta demanda do servidor Gemini. Por favor, tente novamente em instantes.");
+    }
 
     const resultText = response.text;
     if (!resultText) {
